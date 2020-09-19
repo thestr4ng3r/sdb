@@ -255,14 +255,19 @@ static int insertkeys(Sdb *s, const char **args, int nargs, int mode) {
 	return must_save;
 }
 
-static int createdb(const char *f, const char **args, int nargs) {
+// files = whether args+nargs are filenames to merge into f or k=v supplied directly as args
+static int createdb(const char *f, bool read_stdin, bool files, const char **args, int nargs) {
 	char *line, *eq;
 	s = sdb_new (NULL, f, 0);
 	if (!s || !sdb_disk_create (s)) {
 		eprintf ("Cannot create database\n");
 		return 1;
 	}
-	insertkeys (s, args, nargs, '=');
+	if (files) {
+		// TODO
+	} else {
+		insertkeys (s, args, nargs, '=');
+	}
 	sdb_config (s, options);
 	for (; (line = stdin_slurp (NULL));) {
 		if ((eq = strchr (line, '='))) {
@@ -277,7 +282,7 @@ static int createdb(const char *f, const char **args, int nargs) {
 
 static int showusage(int o) {
 	printf ("usage: sdb [-0cdehjJv|-D A B] [-|db] "
-		"[.file]|[-=]|[-+][(idx)key[:json|=value] ..]\n");
+		"[.file]|[-=]|--|[-+][(idx)key[:json|=value] ..]\n");
 	if (o == 2) {
 		printf ("  -0      terminate results with \\x00\n"
 			"  -c      count the number of keys database\n"
@@ -499,8 +504,10 @@ int main(int argc, const char **argv) {
 				free (line);
 			}
 		}
+	} else if (!strcmp (argv[db0 + 1], "--")) {
+		ret = createdb (argv[db0], true, argv + db0 + 2, argc - (db0 + 2));
 	} else if (!strcmp (argv[db0 + 1], "=")) {
-		ret = createdb (argv[db0], NULL, 0);
+		ret = createdb (argv[db0], false, NULL, 0);
 	} else {
 		s = sdb_new (NULL, argv[db0], 0);
 		if (!s) {
