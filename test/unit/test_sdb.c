@@ -11,7 +11,7 @@ static bool foreach_delete_cb(void *user, const char *key, const char *val) {
 }
 
 bool test_sdb_foreach_delete(void) {
-	Sdb *db = sdb_new (NULL, NULL, false);
+	Sdb *db = sdb_new0 ();
 	sdb_set (db, "foo", "bar", 0);
 	sdb_set (db, "bar", "cow", 0);
 	sdb_set (db, "low", "bar", 0);
@@ -25,7 +25,7 @@ bool test_sdb_foreach_delete(void) {
 }
 
 bool test_sdb_list_delete(void) {
-	Sdb *db = sdb_new (NULL, NULL, false);
+	Sdb *db = sdb_new0 ();
 	sdb_set (db, "foo", "bar", 0);
 	sdb_set (db, "bar", "cow", 0);
 	sdb_set (db, "low", "bar", 0);
@@ -58,7 +58,7 @@ bool test_sdb_list_big(void) {
 }
 
 bool test_sdb_delete_none(void) {
-	Sdb *db = sdb_new (NULL, NULL, false);
+	Sdb *db = sdb_new0 ();
 	sdb_set (db, "foo", "bar", 0);
 	sdb_set (db, "bar", "cow", 0);
 	sdb_set (db, "low", "bar", 0);
@@ -74,7 +74,7 @@ bool test_sdb_delete_none(void) {
 }
 
 bool test_sdb_delete_alot(void) {
-	Sdb *db = sdb_new (NULL, NULL, false);
+	Sdb *db = sdb_new0 ();
 	const int count = 2048;
 	int i;
 
@@ -159,7 +159,7 @@ static bool foreach_filter_cb(void *user, const char *key, const char *val) {
 }
 
 bool test_sdb_foreach_filter(void) {
-	Sdb *db = sdb_new (NULL, NULL, false);
+	Sdb *db = sdb_new0 ();
 	sdb_set (db, "foo", "bar", 0);
 	sdb_set (db, "bar", "cow", 0);
 	sdb_set (db, "boo", "cow", 0);

@@ -167,11 +167,10 @@ SDB_API bool sdb_disk_finish (Sdb* s) {
 	// reopen if was open before
 	reopen = true; // always reopen if possible
 	if (reopen) {
-		int rr = sdb_open (s, s->dir);
+		int rr = sdb_open (s, s->dir, SDB_FILE_TYPE_CDB);
 		if (ret && rr < 0) {
 			ret = false;
 		}
-		cdb_init (&s->db, s->fd);
 	}
 	return ret;
 }

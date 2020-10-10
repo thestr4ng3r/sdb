@@ -4,7 +4,7 @@
 void arradd (int count) {
 	RProfile p;
 	int i;
-	Sdb *db = sdb_new (NULL, NULL, 0);
+	Sdb *db = sdb_new0 ();
 	r_prof_start (&p);
 	for (i=0; i<count; i++) {
 		sdb_array_push (db, "foo", "bar", 0);

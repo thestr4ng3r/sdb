@@ -2,7 +2,7 @@
 #include <sdb.h>
 
 bool test_sdb_array_push_pop(void) {
-	Sdb *db = sdb_new (NULL, NULL, false);
+	Sdb *db = sdb_new0 ();
 	char *p;
 
 	sdb_array_push (db, "foo", "foo", 0);
@@ -32,7 +32,7 @@ bool test_sdb_array_push_pop(void) {
 }
 
 bool test_sdb_array_add_remove(void) {
-	Sdb *db = sdb_new (NULL, NULL, false);
+	Sdb *db = sdb_new0 ();
 	sdb_array_add (db, "foo", "foo", 0);
 	sdb_array_add (db, "foo", "bar", 0);
 	sdb_array_add (db, "foo", "cow", 0);

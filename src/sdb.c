@@ -8,6 +8,21 @@
 #include <sys/stat.h>
 #include "sdb.h"
 
+struct sdb_backend_t {
+	bool (*open)(Sdb *s);
+	void (*close)(Sdb *s);
+	bool (*isempty)(Sdb *s);
+	size_t (*count)(Sdb *s);
+	bool (*exists)(Sdb *s, const char *key);
+	const char *(*const_get_len)(Sdb *s, const char *key, int *vlen, ut32 *cas);
+	bool (*foreach)(Sdb *s, SdbForeachCallback cb, void *user);
+	bool (*sync)(Sdb *s);
+	ut32 (*stats)(Sdb *s);
+};
+
+static const SdbBackend cdb_backend;
+static const SdbBackend text_backend;
+
 #if 0
 static inline SdbKv *kv_at(HtPP *ht, HtPPBucket *bt, ut32 i) {
 	return (SdbKv *)((char *)bt->arr + i * ht->opt.elem_size);
@@ -49,15 +64,14 @@ SDB_API void sdb_global_hook(SdbHook hook, void *user) {
 
 // TODO: use mmap instead of read.. much faster!
 SDB_API Sdb* sdb_new0(void) {
-	return sdb_new (NULL, NULL, 0);
+	return sdb_new (NULL, NULL, SDB_FILE_TYPE_CDB, 0);
 }
 
-SDB_API Sdb* sdb_new(const char *path, const char *name, int lock) {
+SDB_API Sdb* sdb_new(const char *path, const char *name, SdbFileType tp, int lock) {
 	Sdb* s = R_NEW0 (Sdb);
 	if (!s) {
 		return NULL;
 	}
-	s->db.fd = -1;
 	s->fd = -1;
 	s->refs = 1;
 	if (path && !*path) {
@@ -91,7 +105,7 @@ SDB_API Sdb* sdb_new(const char *path, const char *name, int lock) {
 			}
 			break;
 		}
-		if (sdb_open (s, s->dir) == -1) {
+		if (sdb_open (s, s->dir, tp) == -1) {
 			s->last = s->timestamped? sdb_now (): 0LL;
 			// TODO: must fail if we cant open for write in sync
 		}
@@ -118,7 +132,6 @@ SDB_API Sdb* sdb_new(const char *path, const char *name, int lock) {
 	if (global_hook) {
 		sdb_hook (s, global_hook, global_user);
 	}
-	cdb_init (&s->db, s->fd);
 	return s;
 fail:
 	if (s->fd != -1) {
@@ -155,11 +168,8 @@ SDB_API bool sdb_merge(Sdb* d, Sdb *s) {
 
 SDB_API bool sdb_isempty(Sdb *s) {
 	if (s) {
-		if (s->db.fd != -1) {
-			sdb_dump_begin (s);
-			while (sdb_dump_hasnext (s)) {
-				return false;
-			}
+		if (s->back && !s->back->isempty (s)) {
+			return false;
 		}
 		if (s->ht && s->ht->count > 0) {
 			return false;
@@ -171,11 +181,8 @@ SDB_API bool sdb_isempty(Sdb *s) {
 SDB_API int sdb_count(Sdb *s) {
 	int count = 0;
 	if (s) {
-		if (s->db.fd != -1) {
-			sdb_dump_begin (s);
-			while (sdb_dump_hasnext (s)) {
-				count++;
-			}
+		if (s->back) {
+			count += s->back->count (s);
 		}
 		if (s->ht) {
 			count += s->ht->count;
@@ -189,7 +196,9 @@ static void sdb_fini(Sdb* s, int donull) {
 		return;
 	}
 	sdb_hook_free (s);
-	cdb_free (&s->db);
+	if (s->back) {
+		s->back->close (s);
+	}
 	if (s->lock) {
 		sdb_unlock (sdb_lock_file (s->dir));
 	}
@@ -228,7 +237,6 @@ SDB_API bool sdb_free(Sdb* s) {
 }
 
 SDB_API const char *sdb_const_get_len(Sdb* s, const char *key, int *vlen, ut32 *cas) {
-	ut32 pos, len;
 	ut64 now = 0LL;
 	bool found;
 
@@ -242,7 +250,6 @@ SDB_API const char *sdb_const_get_len(Sdb* s, const char *key, int *vlen, ut32 *
 		return NULL;
 	}
 	// TODO: optimize, iterate once
-	size_t keylen = strlen (key);
 
 	/* search in memory */
 	SdbKv *kv = (SdbKv*) sdb_ht_find_kvp (s->ht, key, &found);
@@ -268,22 +275,10 @@ SDB_API const char *sdb_const_get_len(Sdb* s, const char *key, int *vlen, ut32 *
 		return sdbkv_value (kv);
 	}
 	/* search in disk */
-	if (s->fd == -1) {
-		return NULL;
+	if (s->back) {
+		return s->back->const_get_len (s, key, vlen, cas);
 	}
-	(void) cdb_findstart (&s->db);
-	if (cdb_findnext (&s->db, s->ht->opt.hashfn (key), key, keylen) < 1) {
-		return NULL;
-	}
-	len = cdb_datalen (&s->db);
-	if (len < SDB_MIN_VALUE || len >= SDB_MAX_VALUE) {
-		return NULL;
-	}
-	if (vlen) {
-		*vlen = len;
-	}
-	pos = cdb_datapos (&s->db);
-	return s->db.map + pos;
+	return NULL;
 }
 
 SDB_API const char *sdb_const_get(Sdb* s, const char *key, ut32 *cas) {
@@ -366,10 +361,7 @@ SDB_API int sdb_add(Sdb* s, const char *key, const char *val, ut32 cas) {
 }
 
 SDB_API bool sdb_exists(Sdb* s, const char *key) {
-	ut32 pos;
-	char ch;
 	bool found;
-	int klen = strlen (key) + 1;
 	if (!s) {
 		return false;
 	}
@@ -378,22 +370,20 @@ SDB_API bool sdb_exists(Sdb* s, const char *key) {
 		char *v = sdbkv_value (kv);
 		return v && *v;
 	}
-	if (s->fd == -1) {
-		return false;
-	}
-	(void)cdb_findstart (&s->db);
-	if (cdb_findnext (&s->db, sdb_hash (key), key, klen)) {
-		pos = cdb_datapos (&s->db);
-		cdb_read (&s->db, &ch, 1, pos);
-		return ch != 0;
+	if (s->back) {
+		return s->back->exists (s, key);
 	}
 	return false;
 }
 
-SDB_API int sdb_open(Sdb *s, const char *file) {
-        struct stat st;
+SDB_API int sdb_open(Sdb *s, const char *file, SdbFileType tp) {
+	struct stat st;
 	if (!s) {
 		return -1;
+	}
+	if (s->back) {
+		s->back->close (s);
+		s->back = NULL;
 	}
 	if (file) {
 		if (s->fd != -1) {
@@ -417,19 +407,27 @@ SDB_API int sdb_open(Sdb *s, const char *file) {
 		}
 		s->last = st.st_mtime;
 	}
-	if (s->fd != -1) {
-		cdb_init (&s->db, s->fd);
+	switch (tp) {
+	case SDB_FILE_TYPE_CDB:
+		s->back = &cdb_backend;
+		break;
+	case SDB_FILE_TYPE_TEXT:
+		s->back = &text_backend;
+		break;
+	}
+	if (s->fd != -1 && s->back) {
+		s->back->open (s);
 	}
 	return s->fd;
 }
 
 SDB_API void sdb_close(Sdb *s) {
 	if (s) {
+		if (s->back) {
+			s->back->close (s);
+			s->back = NULL;
+		}
 		if (s->fd != -1) {
-			if (s->db.fd != -1 && s->db.fd == s->fd) {
-				/* close db fd as well */
-				s->db.fd = -1;
-			}
 			close (s->fd);
 			s->fd = -1;
 		}
@@ -731,46 +729,13 @@ SDB_API SdbList *sdb_foreach_match(Sdb* s, const char *expr, bool single) {
 	return list;
 }
 
-static int getbytes(Sdb *s, char *b, int len) {
-	if (!cdb_read (&s->db, b, len, s->pos)) {
-		return -1;
-	}
-	s->pos += len;
-	return len;
-}
+
 
 static bool sdb_foreach_end(Sdb *s, bool result) {
 	s->depth--;
 	return result;
 }
 
-static bool sdb_foreach_cdb(Sdb *s, SdbForeachCallback cb, SdbForeachCallback cb2, void *user) {
-	char *v = NULL;
-	char k[SDB_MAX_KEY] = {0};
-	bool found;
-	sdb_dump_begin (s);
-	while (sdb_dump_dupnext (s, k, &v, NULL)) {
-		SdbKv *kv = sdb_ht_find_kvp (s->ht, k, &found);
-		if (found) {
-			free (v);
-			if (kv && sdbkv_key (kv) && sdbkv_value (kv)) {
-				if (!cb (user, sdbkv_key (kv), sdbkv_value (kv))) {
-					return false;
-				}
-				if (cb2 && !cb2 (user, k, sdbkv_value (kv))) {
-					return false;
-				}
-			}
-		} else {
-			if (!cb (user, k, v)) {
-				free (v);
-				return false;
-			}
-			free (v);
-		}
-	}
-	return true;
-}
 
 SDB_API bool sdb_foreach(Sdb* s, SdbForeachCallback cb, void *user) {
 	if (!s) {
@@ -818,88 +783,19 @@ static bool _remove_afer_insert(void *user, const char *k, const char *v) {
 }
 
 SDB_API bool sdb_sync(Sdb* s) {
-	bool result;
-	ut32 i;
-
-	if (!s || !sdb_disk_create (s)) {
+	if (!s->back) {
 		return false;
 	}
-	result = sdb_foreach_cdb (s, _insert_into_disk, _remove_afer_insert, s);
-	if (!result) {
-		return false;
-	}
-
-	/* append new keyvalues */
-	for (i = 0; i < s->ht->size; ++i) {
-		HtPPBucket *bt = &s->ht->table[i];
-		SdbKv *kv;
-		ut32 j, count;
-
-		BUCKET_FOREACH_SAFE (s->ht, bt, j, count, kv) {
-			if (sdbkv_key (kv) && sdbkv_value (kv) && *sdbkv_value (kv) && !kv->expire) {
-				if (sdb_disk_insert (s, sdbkv_key (kv), sdbkv_value (kv))) {
-					sdb_remove (s, sdbkv_key (kv), 0);
-				}
-			}
-		}
-	}
-	sdb_disk_finish (s);
-	sdb_journal_clear (s);
-	// TODO: sdb_reset memory state?
-	return true;
+	return s->back->sync (s);
 }
 
-SDB_API void sdb_dump_begin(Sdb* s) {
-	if (s->fd != -1) {
-		s->pos = sizeof (((struct cdb_make *)0)->final);
-		seek_set (s->fd, s->pos);
-	} else {
-		s->pos = 0;
-	}
-}
-
-SDB_API SdbKv *sdb_dump_next(Sdb* s) {
-	char *v = NULL;
-	char k[SDB_MAX_KEY] = {0};
-	int vl = 0;
-	// we dont need to malloc, because all values are null terminated in memory.
-	if (!sdb_dump_dupnext (s, k, &v, &vl)) {
-		return NULL;
-	}
-	vl--;
-	strncpy (sdbkv_key (&s->tmpkv), k, SDB_KSZ - 1);
-	sdbkv_key (&s->tmpkv)[SDB_KSZ - 1] = '\0';
-	free (sdbkv_value (&s->tmpkv));
-	s->tmpkv.base.value = v;
-	s->tmpkv.base.value_len = vl;
-	return &s->tmpkv;
-}
-
-SDB_API bool sdb_dump_hasnext(Sdb* s) {
-	ut32 k, v;
-	if (!cdb_getkvlen (&s->db, &k, &v, s->pos)) {
-		return false;
-	}
-	if (k < 1 || v < 1) {
-		return false;
-	}
-	s->pos += k + v + 4;
-	return true;
-}
 
 SDB_API bool sdb_stats(Sdb *s, ut32 *disk, ut32 *mem) {
 	if (!s) {
 		return false;
 	}
 	if (disk) {
-		ut32 count = 0;
-		if (s->fd != -1) {
-			sdb_dump_begin (s);
-			while (sdb_dump_hasnext (s)) {
-				count ++;
-			}
-		}
-		*disk = count;
+		*disk = s->back ? s->back->stats (s) : 0;
 	}
 	if (mem) {
 		*mem = s->ht->count;
@@ -907,51 +803,6 @@ SDB_API bool sdb_stats(Sdb *s, ut32 *disk, ut32 *mem) {
 	return disk || mem;
 }
 
-// TODO: make it static? internal api?
-SDB_API bool sdb_dump_dupnext(Sdb* s, char *key, char **value, int *_vlen) {
-	ut32 vlen = 0, klen = 0;
-	if (value) {
-		*value = NULL;
-	}
-	if (_vlen) {
-		*_vlen = 0;
-	}
-	if (!cdb_getkvlen (&s->db, &klen, &vlen, s->pos)) {
-		return false;
-	}
-	s->pos += 4;
-	if (klen < 1 || vlen < 1) {
-		return false;
-	}
-	if (_vlen) {
-		*_vlen = vlen;
-	}
-	if (key) {
-		key[0] = 0;
-		if (klen > SDB_MIN_KEY && klen < SDB_MAX_KEY) {
-			if (getbytes (s, key, klen) == -1) {
-				return 0;
-			}
-			key[klen] = 0;
-		}
-	}
-	if (value) {
-		*value = 0;
-		if (vlen < SDB_MAX_VALUE) {
-			*value = malloc (vlen + 10);
-			if (!*value) {
-				return false;
-			}
-			if (getbytes (s, *value, vlen) == -1) {
-				free (*value);
-				*value = NULL;
-				return false;
-			}
-			(*value)[vlen] = 0;
-		}
-	}
-	return true;
-}
 
 static inline ut64 parse_expire (ut64 e) {
 	const ut64 month = 30 * 24 * 60 * 60;
@@ -1211,3 +1062,302 @@ SDB_API char** sdb_like(Sdb *s, const char *k, const char *v, SdbForeachCallback
 	}
 	return (char**)lcd.array;
 }
+
+typedef struct cdb_backend_ctx {
+	struct cdb db;
+	ut32 pos;
+} CdbBackendCtx;
+
+static bool cdb_back_open(Sdb *s) {
+	CdbBackendCtx *ctx = s->back_user;
+	if (!ctx) {
+		s->back_user = calloc (1, sizeof (CdbBackendCtx));
+		if (!s->back_user) {
+			return false;
+		}
+		ctx = s->back_user;
+		ctx->db.fd = -1;
+	}
+	cdb_init (&ctx->db, s->fd);
+}
+
+static void cdb_back_close(Sdb *s) {
+	CdbBackendCtx *ctx = s->back_user;
+	if (!ctx) {
+		return;
+	}
+	cdb_free (&ctx->db);
+	ctx->db.fd = -1;
+	free (ctx);
+	s->back_user = NULL;
+}
+
+static void cdb_back_dump_begin(Sdb *s, CdbBackendCtx *ctx) {
+	if (s->fd != -1) {
+		ctx->pos = sizeof (((struct cdb_make *)0)->final);
+		seek_set (s->fd, ctx->pos);
+	} else {
+		ctx->pos = 0;
+	}
+}
+
+static int cdb_back_get_bytes(Sdb *s, CdbBackendCtx *ctx, char *b, int len) {
+	if (!cdb_read (&ctx->db, b, len, ctx->pos)) {
+		return -1;
+	}
+	ctx->pos += len;
+	return len;
+}
+
+static bool cdb_back_dump_dupnext(Sdb *s, CdbBackendCtx *ctx, char *key, char **value, int *_vlen) {
+	ut32 vlen = 0, klen = 0;
+	if (value) {
+		*value = NULL;
+	}
+	if (_vlen) {
+		*_vlen = 0;
+	}
+	if (!cdb_getkvlen (&ctx->db, &klen, &vlen, ctx->pos)) {
+		return false;
+	}
+	ctx->pos += 4;
+	if (klen < 1 || vlen < 1) {
+		return false;
+	}
+	if (_vlen) {
+		*_vlen = vlen;
+	}
+	if (key) {
+		key[0] = 0;
+		if (klen > SDB_MIN_KEY && klen < SDB_MAX_KEY) {
+			if (cdb_back_get_bytes (s, ctx, key, klen) == -1) {
+				return 0;
+			}
+			key[klen] = 0;
+		}
+	}
+	if (value) {
+		*value = 0;
+		if (vlen < SDB_MAX_VALUE) {
+			*value = malloc (vlen + 10);
+			if (!*value) {
+				return false;
+			}
+			if (cdb_back_get_bytes (s, ctx, *value, vlen) == -1) {
+				free (*value);
+				*value = NULL;
+				return false;
+			}
+			(*value)[vlen] = 0;
+		}
+	}
+	return true;
+}
+
+static SdbKv *cdb_back_dump_next(Sdb *s, CdbBackendCtx *ctx) {
+	char *v = NULL;
+	char k[SDB_MAX_KEY] = {0};
+	int vl = 0;
+	// we dont need to malloc, because all values are null terminated in memory.
+	if (!cdb_back_dump_dupnext (s, ctx, k, &v, &vl)) {
+		return NULL;
+	}
+	vl--;
+	strncpy (sdbkv_key (&s->tmpkv), k, SDB_KSZ - 1);
+	sdbkv_key (&s->tmpkv)[SDB_KSZ - 1] = '\0';
+	free (sdbkv_value (&s->tmpkv));
+	s->tmpkv.base.value = v;
+	s->tmpkv.base.value_len = vl;
+	return &s->tmpkv;
+}
+
+static bool cdb_back_dump_hasnext(Sdb *s, CdbBackendCtx *ctx) {
+	ut32 k, v;
+	if (!cdb_getkvlen (&ctx->db, &k, &v, ctx->pos)) {
+		return false;
+	}
+	if (k < 1 || v < 1) {
+		return false;
+	}
+	ctx->pos += k + v + 4;
+	return true;
+}
+
+static bool cdb_back_isempty(Sdb *s) {
+	CdbBackendCtx *ctx = s->back_user;
+	if (!ctx) {
+		return true;
+	}
+	if (ctx->db.fd != -1) {
+		cdb_back_dump_begin (s, ctx);
+		while (cdb_back_dump_hasnext (s, ctx)) {
+			return false;
+		}
+	}
+}
+
+static size_t cdb_back_count(Sdb *s) {
+	CdbBackendCtx *ctx = s->back_user;
+	if (!ctx) {
+		return 0;
+	}
+	size_t count;
+	if (ctx->db.fd != -1) {
+		cdb_back_dump_begin (s, ctx);
+		while (cdb_back_dump_hasnext (s, ctx)) {
+			count++;
+		}
+	}
+	return count;
+}
+
+bool cdb_back_exists(Sdb *s, const char *key) {
+	CdbBackendCtx *ctx = s->back_user;
+	if (!ctx) {
+		return NULL;
+	}
+	if (s->fd == -1) {
+		return false;
+	}
+	ut32 pos;
+	size_t klen = strlen (key) + 1;
+	char ch;
+	(void)cdb_findstart (&ctx->db);
+	if (cdb_findnext (&ctx->db, sdb_hash (key), key, klen)) {
+		pos = cdb_datapos (&ctx->db);
+		cdb_read (&ctx->db, &ch, 1, pos);
+		return ch != 0;
+	}
+	return false;
+}
+
+const char *cdb_back_const_get_len(Sdb *s, const char *key, int *vlen, ut32 *cas) {
+	CdbBackendCtx *ctx = s->back_user;
+	if (!ctx) {
+		return NULL;
+	}
+	if (s->fd == -1) {
+		return NULL;
+	}
+	(void) cdb_findstart (&ctx->db);
+	size_t keylen = strlen (key);
+	if (cdb_findnext (&ctx->db, s->ht->opt.hashfn (key), key, keylen) < 1) {
+		return NULL;
+	}
+	ut32 len = cdb_datalen (&ctx->db);
+	if (len < SDB_MIN_VALUE || len >= SDB_MAX_VALUE) {
+		return NULL;
+	}
+	if (vlen) {
+		*vlen = len;
+	}
+	ut32 pos = cdb_datapos (&ctx->->db);
+	return ctx->db.map + pos;
+}
+
+static bool cdb_back_foreach2(Sdb *s, SdbForeachCallback cb, SdbForeachCallback cb2, void *user) {
+	CdbBackendCtx *ctx = s->back_user;
+	if (!ctx) {
+		return NULL;
+	}
+	char *v = NULL;
+	char k[SDB_MAX_KEY] = {0};
+	bool found;
+	cdb_back_dump_begin (s, ctx);
+	while (cdb_back_dump_dupnext (s, ctx, k, &v, NULL)) {
+		SdbKv *kv = sdb_ht_find_kvp (s->ht, k, &found);
+		if (found) {
+			free (v);
+			if (kv && sdbkv_key (kv) && sdbkv_value (kv)) {
+				if (!cb (user, sdbkv_key (kv), sdbkv_value (kv))) {
+					return false;
+				}
+				if (cb2 && !cb2 (user, k, sdbkv_value (kv))) {
+					return false;
+				}
+			}
+		} else {
+			if (!cb (user, k, v)) {
+				free (v);
+				return false;
+			}
+			free (v);
+		}
+	}
+	return true;
+}
+
+static bool cdb_back_foreach(Sdb *s, SdbForeachCallback cb, void *user) {
+	return cdb_back_foreach2 (s, cb, NULL, user);
+}
+
+static bool cdb_back_sync(Sdb *s) {
+	bool result;
+	ut32 i;
+
+	if (!s || !sdb_disk_create (s)) {
+		return false;
+	}
+	result = cdb_back_foreach2 (s, _insert_into_disk, _remove_afer_insert, s);
+	if (!result) {
+		return false;
+	}
+
+	/* append new keyvalues */
+	for (i = 0; i < s->ht->size; ++i) {
+		HtPPBucket *bt = &s->ht->table[i];
+		SdbKv *kv;
+		ut32 j, count;
+
+		BUCKET_FOREACH_SAFE (s->ht, bt, j, count, kv) {
+			if (sdbkv_key (kv) && sdbkv_value (kv) && *sdbkv_value (kv) && !kv->expire) {
+				if (sdb_disk_insert (s, sdbkv_key (kv), sdbkv_value (kv))) {
+					sdb_remove (s, sdbkv_key (kv), 0);
+				}
+			}
+		}
+	}
+	sdb_disk_finish (s);
+	sdb_journal_clear (s);
+	// TODO: sdb_reset memory state?
+	return true;
+}
+
+static ut32 cdb_back_stats(Sdb *s) {
+	CdbBackendCtx *ctx = s->back_user;
+	if (!ctx) {
+		return NULL;
+	}
+	ut32 count = 0;
+	if (s->fd != -1) {
+		cdb_back_dump_begin (s, ctx);
+		while (cdb_back_dump_hasnext (s, ctx)) {
+			count++;
+		}
+	}
+	return count;
+}
+
+static const SdbBackend cdb_backend = {
+	.open = cdb_back_open,
+	.close = cdb_back_close,
+	.isempty = cdb_back_isempty,
+	.count = cdb_back_count,
+	.exists = cdb_back_exists,
+	.const_get_len = cdb_back_const_get_len,
+	.foreach = cdb_back_foreach,
+	.sync = cdb_back_sync,
+	.stats = cdb_back_stats
+};
+
+static bool text_back_open(Sdb *s) {
+}
+
+static void text_back_close(Sdb *s) {
+}
+
+static const SdbBackend text_backend = {
+	.open = text_back_open,
+	.close = text_back_close
+};
+

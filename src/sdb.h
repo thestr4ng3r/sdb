@@ -74,6 +74,7 @@ extern char *strdup (const char *);
 #define SDB_KSZ 0xff
 #define SDB_VSZ 0xffffff
 
+typedef struct sdb_backend_t SdbBackend;
 
 typedef struct sdb_t {
 	char *dir; // path+name
@@ -83,11 +84,11 @@ typedef struct sdb_t {
 	int refs; // reference counter
 	int lock;
 	int journal;
-	struct cdb db;
+	const SdbBackend *back;
+	void *back_user;
 	struct cdb_make m;
 	HtPP *ht;
 	ut32 eod;
-	ut32 pos;
 	int fdump;
 	char *ndump;
 	ut64 expire;
@@ -108,10 +109,15 @@ typedef struct sdb_ns_t {
 	Sdb *sdb;
 } SdbNs;
 
-SDB_API Sdb* sdb_new0(void);
-SDB_API Sdb* sdb_new(const char *path, const char *file, int lock);
+typedef enum {
+	SDB_FILE_TYPE_CDB,
+	SDB_FILE_TYPE_TEXT
+} SdbFileType;
 
-SDB_API int sdb_open(Sdb *s, const char *file);
+SDB_API Sdb* sdb_new0(void);
+SDB_API Sdb* sdb_new(const char *path, const char *file, SdbFileType tp, int lock);
+
+SDB_API int sdb_open(Sdb *s, const char *file, SdbFileType tp);
 SDB_API void sdb_close(Sdb *s);
 
 SDB_API void sdb_config(Sdb *s, int options);
@@ -127,7 +133,6 @@ SDB_API void sdb_drain(Sdb*, Sdb*);
 SDB_API void sdb_copy(Sdb *src, Sdb *dst);
 
 SDB_API bool sdb_stats(Sdb *s, ut32 *disk, ut32 *mem);
-SDB_API bool sdb_dump_hasnext (Sdb* s);
 
 typedef bool (*SdbForeachCallback)(void *user, const char *k, const char *v);
 SDB_API bool sdb_foreach(Sdb* s, SdbForeachCallback cb, void *user);
@@ -211,11 +216,6 @@ SDB_API bool sdb_text_save_fd(Sdb *s, int fd, bool sort);
 SDB_API bool sdb_text_save(Sdb *s, const char *file, bool sort);
 SDB_API bool sdb_text_load_buf(Sdb *s, char *buf, size_t sz);
 SDB_API bool sdb_text_load(Sdb *s, const char *file);
-
-/* iterate */
-SDB_API void sdb_dump_begin(Sdb* s);
-SDB_API SdbKv *sdb_dump_next(Sdb* s);
-SDB_API bool sdb_dump_dupnext(Sdb* s, char *key, char **value, int *_vlen);
 
 /* journaling */
 SDB_API bool sdb_journal_close(Sdb *s);

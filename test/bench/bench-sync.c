@@ -8,7 +8,7 @@ void dosync (int count) {
 	RProfile p;
 	int i;
 	unlink (DBFILE);
-	Sdb *db = sdb_new (NULL, DBFILE, 0);
+	Sdb *db = sdb_new (NULL, DBFILE, SDB_FILE_TYPE_CDB, 0);
 	for (i=0; i<count; i++) {
 		sprintf (rkey, "%d", i);
 		sdb_set (db, rkey, rkey, 0);

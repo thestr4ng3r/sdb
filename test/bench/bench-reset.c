@@ -5,7 +5,7 @@ void dosync (int count) {
 	char rkey[128];
 	RProfile p;
 	int i;
-	Sdb *db = sdb_new (NULL, NULL, 0);
+	Sdb *db = sdb_new0 ();
 	r_prof_start (&p);
 	for (i=0; i<count; i++) {
 		sprintf (rkey, "%d", i);

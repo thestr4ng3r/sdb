@@ -158,7 +158,7 @@ static char *slurp(FILE *f, size_t *sz) {
 static void synchronize(int sig UNUSED) {
 	// TODO: must be in sdb_sync() or wat?
 	sdb_sync (s);
-	Sdb *n = sdb_new (s->path, s->name, s->lock);
+	Sdb *n = sdb_new (s->path, s->name, SDB_FILE_TYPE_CDB, s->lock);
 	if (n) {
 		sdb_config (n, options);
 		sdb_free (s);
@@ -167,47 +167,59 @@ static void synchronize(int sig UNUSED) {
 }
 #endif
 
+typedef struct {
+	int fmt;
+	bool grep;
+	const char *expgrep;
+	const char *comma;
+} GrepDumpCtx;
+
+static bool grep_dump_cb(void *user, const char *k, const char *v) {
+	GrepDumpCtx *ctx = user;
+	if (ctx->grep && !strstr (k, ctx->expgrep) && !strstr (v, ctx->expgrep)) {
+		return true;
+	}
+	switch (ctx->fmt) {
+	case MODE_JSON:
+		if (!strcmp (v, "true") || !strcmp (v, "false")) {
+			printf ("%s\"%s\":%s", ctx->comma, k, v);
+		} else if (sdb_isnum (v)) {
+			printf ("%s\"%s\":%llu", ctx->comma, k, sdb_atoi (v));
+		} else if (*v == '{' || *v == '[') {
+			printf ("%s\"%s\":%s", ctx->comma, k, v);
+		} else {
+			printf ("%s\"%s\":\"%s\"", ctx->comma, k, v);
+		}
+		ctx->comma = ",";
+		break;
+	case MODE_ZERO:
+		printf ("%s=%s", k, v);
+		break;
+	default:
+		printf ("%s=%s\n", k, v);
+		break;
+	}
+	return true;
+}
+
 static int sdb_grep_dump(const char *dbname, int fmt, bool grep,
                          const char *expgrep) {
-	char *v, k[SDB_MAX_KEY] = { 0 };
-	const char *comma = "";
+	GrepDumpCtx ctx = {
+		.fmt = fmt,
+		.grep = grep,
+		.expgrep = expgrep,
+		.comma = ""
+	};
 	// local db beacuse is readonly and we dont need to finalize in case of ^C
-	Sdb *db = sdb_new (NULL, dbname, 0);
+	Sdb *db = sdb_new (NULL, dbname, SDB_FILE_TYPE_CDB, 0);
 	if (!db) {
 		return 1;
 	}
 	sdb_config (db, options);
-	sdb_dump_begin (db);
 	if (fmt == MODE_JSON) {
 		printf ("{");
 	}
-	while (sdb_dump_dupnext (db, k, &v, NULL)) {
-		if (grep && !strstr (k, expgrep) && !strstr (v, expgrep)) {
-			free (v);
-			continue;
-		}
-		switch (fmt) {
-		case MODE_JSON:
-			if (!strcmp (v, "true") || !strcmp (v, "false")) {
-				printf ("%s\"%s\":%s", comma, k, v);
-			} else if (sdb_isnum (v)) {
-				printf ("%s\"%s\":%llu", comma, k, sdb_atoi (v));
-			} else if (*v == '{' || *v == '[') {
-				printf ("%s\"%s\":%s", comma, k, v);
-			} else {
-				printf ("%s\"%s\":\"%s\"", comma, k, v);
-			}
-			comma = ",";
-			break;
-		case MODE_ZERO:
-			printf ("%s=%s", k, v);
-			break;
-		default:
-			printf ("%s=%s\n", k, v);
-			break;
-		}
-		free (v);
-	}
+	sdb_foreach (db, grep_dump_cb, &ctx);
 	switch (fmt) {
 	case MODE_ZERO:
 		fflush (stdout);
@@ -256,7 +268,7 @@ static int insertkeys(Sdb *s, const char **args, int nargs, int mode) {
 }
 
 static int createdb(const char *f, const char **args, int nargs) {
-	s = sdb_new (NULL, f, 0);
+	s = sdb_new (NULL, f, SDB_FILE_TYPE_CDB, 0);
 	if (!s) {
 		eprintf ("Cannot create database\n");
 		return 1;
@@ -393,8 +405,8 @@ beach:
 }
 
 static bool dbdiff(const char *a, const char *b) {
-	Sdb *A = sdb_new (NULL, a, 0);
-	Sdb *B = sdb_new (NULL, b, 0);
+	Sdb *A = sdb_new (NULL, a, SDB_FILE_TYPE_CDB, 0);
+	Sdb *B = sdb_new (NULL, b, SDB_FILE_TYPE_CDB, 0);
 	bool equal = sdb_diff (A, B, dbdiff_cb, NULL);
 	sdb_free (A);
 	sdb_free (B);
@@ -403,7 +415,7 @@ static bool dbdiff(const char *a, const char *b) {
 
 int showcount(const char *db) {
 	ut32 d;
-	s = sdb_new (NULL, db, 0);
+	s = sdb_new (NULL, db, SDB_FILE_TYPE_CDB, 0);
 	if (sdb_stats (s, &d, NULL)) {
 		printf ("%d\n", d);
 	}
@@ -500,7 +512,7 @@ int main(int argc, const char **argv) {
 #endif
 	int ret = 0;
 	if (interactive || !strcmp (argv[db0 + 1], "-")) {
-		if ((s = sdb_new (NULL, argv[db0], 0))) {
+		if ((s = sdb_new (NULL, argv[db0], SDB_FILE_TYPE_CDB, 0))) {
 			sdb_config (s, options);
 			int kvs = db0 + 2;
 			if (kvs < argc) {
@@ -520,7 +532,7 @@ int main(int argc, const char **argv) {
 	} else if (!strcmp (argv[db0 + 1], "==")) {
 		ret = createdb (argv[db0], argv + db0 + 2, argc - (db0 + 2));
 	} else {
-		s = sdb_new (NULL, argv[db0], 0);
+		s = sdb_new (NULL, argv[db0], SDB_FILE_TYPE_CDB, 0);
 		if (!s) {
 			return 1;
 		}
